@@ -493,6 +493,157 @@ func TestGetNodesWithFencingSecrets(t *testing.T) {
 	}
 }
 
+// TestCreateEtcdRestartJobConfigFunc tests the drift detection config function
+// for the etcd-restart job controller. It verifies that the config changes when
+// the BundleRolloutRevisionAnnotation on etcd-all-bundles changes, triggering
+// a job restart after CA bundle rotation.
+func TestCreateEtcdRestartJobConfigFunc(t *testing.T) {
+	tests := []struct {
+		name           string
+		configMap      *corev1.ConfigMap
+		expectError    bool
+		expectRevision string
+		compareWith    *corev1.ConfigMap
+		expectDrift    bool
+	}{
+		{
+			name: "returns config with bundle revision annotation",
+			configMap: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd-all-bundles",
+					Namespace: operatorclient.TargetNamespace,
+					Annotations: map[string]string{
+						"openshift.io/ceo-bundle-rollout-revision": "5",
+					},
+				},
+				Data: map[string]string{
+					"server-ca-bundle.crt":  "cert-data",
+					"metrics-ca-bundle.crt": "metrics-cert-data",
+				},
+			},
+			expectError:    false,
+			expectRevision: "5",
+		},
+		{
+			name: "returns empty revision when annotation missing",
+			configMap: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd-all-bundles",
+					Namespace: operatorclient.TargetNamespace,
+				},
+				Data: map[string]string{
+					"server-ca-bundle.crt": "cert-data",
+				},
+			},
+			expectError:    false,
+			expectRevision: "",
+		},
+		{
+			name:        "returns error when configmap missing",
+			configMap:   nil,
+			expectError: true,
+		},
+		{
+			name: "detects drift when revision changes",
+			configMap: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd-all-bundles",
+					Namespace: operatorclient.TargetNamespace,
+					Annotations: map[string]string{
+						"openshift.io/ceo-bundle-rollout-revision": "5",
+					},
+				},
+			},
+			compareWith: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd-all-bundles",
+					Namespace: operatorclient.TargetNamespace,
+					Annotations: map[string]string{
+						"openshift.io/ceo-bundle-rollout-revision": "6",
+					},
+				},
+			},
+			expectError:    false,
+			expectRevision: "5",
+			expectDrift:    true,
+		},
+		{
+			name: "no drift when revision unchanged",
+			configMap: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd-all-bundles",
+					Namespace: operatorclient.TargetNamespace,
+					Annotations: map[string]string{
+						"openshift.io/ceo-bundle-rollout-revision": "5",
+					},
+				},
+			},
+			compareWith: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd-all-bundles",
+					Namespace: operatorclient.TargetNamespace,
+					Annotations: map[string]string{
+						"openshift.io/ceo-bundle-rollout-revision": "5",
+					},
+				},
+			},
+			expectError:    false,
+			expectRevision: "5",
+			expectDrift:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeKubeClient := fake.NewClientset()
+			kubeInformersForNamespaces := v1helpers.NewKubeInformersForNamespaces(
+				fakeKubeClient,
+				operatorclient.TargetNamespace,
+			)
+
+			stopCh := make(chan struct{})
+			defer close(stopCh)
+			kubeInformersForNamespaces.Start(stopCh)
+			synced := kubeInformersForNamespaces.WaitForCacheSync(stopCh)
+			for ns, typeSynced := range synced {
+				for typ, s := range typeSynced {
+					require.True(t, s, "informer for namespace %s type %v failed to sync", ns, typ)
+				}
+			}
+
+			if tt.configMap != nil {
+				cmInformer := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
+				require.NoError(t, cmInformer.GetIndexer().Add(tt.configMap))
+			}
+
+			configFunc := createEtcdRestartJobConfigFunc(kubeInformersForNamespaces)
+			result, err := configFunc()
+
+			if tt.expectError {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Contains(t, result, fmt.Sprintf(`"bundleRevision":"%s"`, tt.expectRevision))
+
+			if tt.compareWith != nil {
+				cmInformer := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
+				require.NoError(t, cmInformer.GetIndexer().Update(tt.compareWith))
+
+				result2, err := configFunc()
+				require.NoError(t, err)
+
+				if tt.expectDrift {
+					require.NotEqual(t, result, result2, "Expected config to change (drift detected)")
+				} else {
+					require.Equal(t, result, result2, "Expected config to be stable (no drift)")
+				}
+			}
+		})
+	}
+}
+
 // retryableError is a helper type for testing retry logic
 type retryableError struct {
 	msg string

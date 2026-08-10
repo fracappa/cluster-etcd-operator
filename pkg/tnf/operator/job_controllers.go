@@ -22,7 +22,9 @@ import (
 
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/bootstrapteardown"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
+	"github.com/openshift/cluster-etcd-operator/pkg/operator/etcdcertsigner"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
+	"github.com/openshift/cluster-etcd-operator/pkg/tlshelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/etcd"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/jobs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
@@ -250,6 +252,15 @@ func startTnfJobcontrollers(
 		fencingJobConfigFunc := createFencingJobConfigFunc(lifecycleManager, kubeInformersForNamespaces)
 		jobs.RunClusterJobController(ctx, tools.JobTypeFencing, schedulableNodesFunc, fencingAffectedNodesFunc, fencingJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
+		// Etcd-restart job: restarts podman-etcd after CA bundle rotation.
+		// etcd 3.6 hot-reloads leaf certs but not --trusted-ca-file / --peer-trusted-ca-file,
+		// so a process restart is required when the CA bundle changes.
+		etcdRestartAffectedNodesFunc := func() ([]*corev1.Node, error) {
+			return tools.ListNodesFromInformer(lifecycleManager.controlPlaneNodeInformer)
+		}
+		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(kubeInformersForNamespaces)
+		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+
 		// Start status collector (only after transition is complete, when Pacemaker exists)
 		lifecycleManager.runPacemakerStatusCollectorCronJob(ctx)
 
@@ -445,6 +456,33 @@ func createFencingJobConfigFunc(lifecycleManager *pacemakerLifecycleManager, kub
 		configJSON, err := json.Marshal(config)
 		if err != nil {
 			return "", fmt.Errorf("failed to marshal fencing config: %w", err)
+		}
+
+		return string(configJSON), nil
+	}
+}
+
+// createEtcdRestartJobConfigFunc creates a JobConfigFunc that tracks the
+// BundleRolloutRevisionAnnotation on the etcd-all-bundles ConfigMap. When the
+// cert signer updates the CA bundle, the annotation changes and drift detection
+// triggers a new etcd-restart job.
+func createEtcdRestartJobConfigFunc(kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
+	return func() (string, error) {
+		configMapLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Lister()
+		cm, err := configMapLister.ConfigMaps(operatorclient.TargetNamespace).Get(tlshelpers.EtcdAllBundlesConfigMapName)
+		if err != nil {
+			return "", fmt.Errorf("failed to get %s configmap: %w", tlshelpers.EtcdAllBundlesConfigMapName, err)
+		}
+
+		bundleRevision := cm.Annotations[etcdcertsigner.BundleRolloutRevisionAnnotation]
+
+		config := map[string]string{
+			"bundleRevision": bundleRevision,
+		}
+
+		configJSON, err := json.Marshal(config)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal etcd-restart config: %w", err)
 		}
 
 		return string(configJSON), nil

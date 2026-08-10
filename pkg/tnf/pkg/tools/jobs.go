@@ -22,6 +22,7 @@ const (
 	FencingJobCompletedTimeout     = 25 * time.Minute
 	AlertConfigurationTimeout      = 60 * time.Minute
 	UpdateSetupJobCompletedTimeout = 65 * time.Minute
+	EtcdRestartJobCompletedTimeout = 25 * time.Minute
 )
 
 // JobType represent the different jobs we run, with some methods needed
@@ -34,6 +35,7 @@ const (
 	JobTypeAfterSetup
 	JobTypeFencing
 	JobTypeUpdateSetup
+	JobTypeEtcdRestart
 )
 
 const (
@@ -56,6 +58,8 @@ func (t JobType) GetSubCommand() string {
 		return "fencing"
 	case JobTypeUpdateSetup:
 		return "update-setup"
+	case JobTypeEtcdRestart:
+		return "etcd-restart"
 	default:
 		return ""
 	}

@@ -53,6 +53,13 @@ func TestGetJobName(t *testing.T) {
 			expectedName:   "tnf-update-setup-job",
 			expectedMaxLen: MaxK8sResourceNameLength,
 		},
+		{
+			name:           "EtcdRestart job without node name",
+			jobType:        JobTypeEtcdRestart,
+			nodeName:       nil,
+			expectedName:   "tnf-etcd-restart-job",
+			expectedMaxLen: MaxK8sResourceNameLength,
+		},
 		// All job types with short node name
 		{
 			name:           "Auth job with short node name",

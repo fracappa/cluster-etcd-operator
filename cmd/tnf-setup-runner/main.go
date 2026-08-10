@@ -17,6 +17,7 @@ import (
 
 	tnfaftersetup "github.com/openshift/cluster-etcd-operator/pkg/tnf/after-setup"
 	tnfauth "github.com/openshift/cluster-etcd-operator/pkg/tnf/auth"
+	tnfetcdrestart "github.com/openshift/cluster-etcd-operator/pkg/tnf/etcd-restart"
 	tnffencing "github.com/openshift/cluster-etcd-operator/pkg/tnf/fencing"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
 	tnfsetup "github.com/openshift/cluster-etcd-operator/pkg/tnf/setup"
@@ -60,6 +61,7 @@ func NewTnfSetupRunnerCommand() *cobra.Command {
 	cmd.AddCommand(NewAfterSetupCommand())
 	cmd.AddCommand(NewFencingCommand())
 	cmd.AddCommand(NewUpdateSetupCommand())
+	cmd.AddCommand(NewEtcdRestartCommand())
 
 	return cmd
 }
@@ -122,6 +124,19 @@ func NewUpdateSetupCommand() *cobra.Command {
 		Short: "Update the Two Node Fencing pacemaker configuration",
 		Run: func(cmd *cobra.Command, args []string) {
 			err := tnfupdatesetup.RunTnfUpdateSetup()
+			if err != nil {
+				klog.Fatal(err)
+			}
+		},
+	}
+}
+
+func NewEtcdRestartCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   tools.JobTypeEtcdRestart.GetSubCommand(),
+		Short: "Rolling restart of etcd after CA bundle rotation",
+		Run: func(cmd *cobra.Command, args []string) {
+			err := tnfetcdrestart.RunTnfEtcdRestart()
 			if err != nil {
 				klog.Fatal(err)
 			}
