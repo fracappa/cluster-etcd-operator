@@ -22,9 +22,7 @@ import (
 
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/bootstrapteardown"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
-	"github.com/openshift/cluster-etcd-operator/pkg/operator/etcdcertsigner"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
-	"github.com/openshift/cluster-etcd-operator/pkg/tlshelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/etcd"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/jobs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
@@ -258,7 +256,7 @@ func startTnfJobcontrollers(
 		etcdRestartAffectedNodesFunc := func() ([]*corev1.Node, error) {
 			return tools.ListNodesFromInformer(lifecycleManager.controlPlaneNodeInformer)
 		}
-		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(kubeInformersForNamespaces)
+		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(operatorClient)
 		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 		// Start status collector (only after transition is complete, when Pacemaker exists)
@@ -462,22 +460,33 @@ func createFencingJobConfigFunc(lifecycleManager *pacemakerLifecycleManager, kub
 	}
 }
 
-// createEtcdRestartJobConfigFunc creates a JobConfigFunc that tracks the
-// BundleRolloutRevisionAnnotation on the etcd-all-bundles ConfigMap. When the
-// cert signer updates the CA bundle, the annotation changes and drift detection
-// triggers a new etcd-restart job.
-func createEtcdRestartJobConfigFunc(kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
+// createEtcdRestartJobConfigFunc creates a JobConfigFunc that tracks the minimum
+// static pod revision deployed across all nodes. This revision advances only when
+// ALL nodes have the new cert files on disk, preventing a race where etcd restarts
+// before the CA bundle is synced to the host filesystem.
+//
+// On TNF clusters, etcd runs under Pacemaker (not as a static pod), so it is never
+// restarted automatically by the kubelet on revision changes. This drift-detection
+// provides that restart: whenever the deployed revision advances (CA rotation,
+// cipher suite change, or any other cert/config update), the etcd-restart job fires.
+func createEtcdRestartJobConfigFunc(operatorClient v1helpers.StaticPodOperatorClient) jobs.JobConfigFunc {
 	return func() (string, error) {
-		configMapLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Lister()
-		cm, err := configMapLister.ConfigMaps(operatorclient.TargetNamespace).Get(tlshelpers.EtcdAllBundlesConfigMapName)
+		_, opStatus, _, err := operatorClient.GetStaticPodOperatorState()
 		if err != nil {
-			return "", fmt.Errorf("failed to get %s configmap: %w", tlshelpers.EtcdAllBundlesConfigMapName, err)
+			return "", fmt.Errorf("failed to get operator state: %w", err)
 		}
 
-		bundleRevision := cm.Annotations[etcdcertsigner.BundleRolloutRevisionAnnotation]
+		// Use the minimum revision across all nodes. This only advances when
+		// every node has deployed the new revision, meaning cert files are on disk.
+		deployedRevision := opStatus.LatestAvailableRevision
+		for _, ns := range opStatus.NodeStatuses {
+			if ns.CurrentRevision < deployedRevision {
+				deployedRevision = ns.CurrentRevision
+			}
+		}
 
 		config := map[string]string{
-			"bundleRevision": bundleRevision,
+			"deployedRevision": fmt.Sprintf("%d", deployedRevision),
 		}
 
 		configJSON, err := json.Marshal(config)

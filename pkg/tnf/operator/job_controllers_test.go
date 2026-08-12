@@ -494,154 +494,115 @@ func TestGetNodesWithFencingSecrets(t *testing.T) {
 }
 
 // TestCreateEtcdRestartJobConfigFunc tests the drift detection config function
-// for the etcd-restart job controller. It verifies that the config changes when
-// the BundleRolloutRevisionAnnotation on etcd-all-bundles changes, triggering
-// a job restart after CA bundle rotation.
+// for the etcd-restart job controller. It verifies that the config tracks the
+// minimum deployed revision across all nodes, so etcd is only restarted after
+// cert files are synced to disk on all nodes.
 func TestCreateEtcdRestartJobConfigFunc(t *testing.T) {
+	makeStatus := func(latestRevision int32, nodeStatuses []operatorv1.NodeStatus) *operatorv1.StaticPodOperatorStatus {
+		return &operatorv1.StaticPodOperatorStatus{
+			OperatorStatus: operatorv1.OperatorStatus{
+				LatestAvailableRevision: latestRevision,
+			},
+			NodeStatuses: nodeStatuses,
+		}
+	}
+
 	tests := []struct {
 		name           string
-		configMap      *corev1.ConfigMap
-		expectError    bool
+		status         *operatorv1.StaticPodOperatorStatus
 		expectRevision string
-		compareWith    *corev1.ConfigMap
-		expectDrift    bool
 	}{
 		{
-			name: "returns config with bundle revision annotation",
-			configMap: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "etcd-all-bundles",
-					Namespace: operatorclient.TargetNamespace,
-					Annotations: map[string]string{
-						"openshift.io/ceo-bundle-rollout-revision": "5",
-					},
-				},
-				Data: map[string]string{
-					"server-ca-bundle.crt":  "cert-data",
-					"metrics-ca-bundle.crt": "metrics-cert-data",
-				},
-			},
-			expectError:    false,
+			name: "all nodes at latest revision",
+			status: makeStatus(9, []operatorv1.NodeStatus{
+				{NodeName: "master-0", CurrentRevision: 9},
+				{NodeName: "master-1", CurrentRevision: 9},
+			}),
+			expectRevision: "9",
+		},
+		{
+			name: "one node behind during rollout",
+			status: makeStatus(9, []operatorv1.NodeStatus{
+				{NodeName: "master-0", CurrentRevision: 9},
+				{NodeName: "master-1", CurrentRevision: 8},
+			}),
+			expectRevision: "8",
+		},
+		{
+			name:           "no node statuses yet",
+			status:         makeStatus(5, []operatorv1.NodeStatus{}),
 			expectRevision: "5",
-		},
-		{
-			name: "returns empty revision when annotation missing",
-			configMap: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "etcd-all-bundles",
-					Namespace: operatorclient.TargetNamespace,
-				},
-				Data: map[string]string{
-					"server-ca-bundle.crt": "cert-data",
-				},
-			},
-			expectError:    false,
-			expectRevision: "",
-		},
-		{
-			name:        "returns error when configmap missing",
-			configMap:   nil,
-			expectError: true,
-		},
-		{
-			name: "detects drift when revision changes",
-			configMap: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "etcd-all-bundles",
-					Namespace: operatorclient.TargetNamespace,
-					Annotations: map[string]string{
-						"openshift.io/ceo-bundle-rollout-revision": "5",
-					},
-				},
-			},
-			compareWith: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "etcd-all-bundles",
-					Namespace: operatorclient.TargetNamespace,
-					Annotations: map[string]string{
-						"openshift.io/ceo-bundle-rollout-revision": "6",
-					},
-				},
-			},
-			expectError:    false,
-			expectRevision: "5",
-			expectDrift:    true,
-		},
-		{
-			name: "no drift when revision unchanged",
-			configMap: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "etcd-all-bundles",
-					Namespace: operatorclient.TargetNamespace,
-					Annotations: map[string]string{
-						"openshift.io/ceo-bundle-rollout-revision": "5",
-					},
-				},
-			},
-			compareWith: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "etcd-all-bundles",
-					Namespace: operatorclient.TargetNamespace,
-					Annotations: map[string]string{
-						"openshift.io/ceo-bundle-rollout-revision": "5",
-					},
-				},
-			},
-			expectError:    false,
-			expectRevision: "5",
-			expectDrift:    false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fakeKubeClient := fake.NewClientset()
-			kubeInformersForNamespaces := v1helpers.NewKubeInformersForNamespaces(
-				fakeKubeClient,
-				operatorclient.TargetNamespace,
+			fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+				&operatorv1.StaticPodOperatorSpec{},
+				tt.status,
+				nil,
+				nil,
 			)
 
-			stopCh := make(chan struct{})
-			defer close(stopCh)
-			kubeInformersForNamespaces.Start(stopCh)
-			synced := kubeInformersForNamespaces.WaitForCacheSync(stopCh)
-			for ns, typeSynced := range synced {
-				for typ, s := range typeSynced {
-					require.True(t, s, "informer for namespace %s type %v failed to sync", ns, typ)
-				}
-			}
-
-			if tt.configMap != nil {
-				cmInformer := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
-				require.NoError(t, cmInformer.GetIndexer().Add(tt.configMap))
-			}
-
-			configFunc := createEtcdRestartJobConfigFunc(kubeInformersForNamespaces)
+			configFunc := createEtcdRestartJobConfigFunc(fakeOperatorClient)
 			result, err := configFunc()
 
-			if tt.expectError {
-				require.Error(t, err)
-				return
-			}
-
 			require.NoError(t, err)
-			require.Contains(t, result, fmt.Sprintf(`"bundleRevision":"%s"`, tt.expectRevision))
-
-			if tt.compareWith != nil {
-				cmInformer := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
-				require.NoError(t, cmInformer.GetIndexer().Update(tt.compareWith))
-
-				result2, err := configFunc()
-				require.NoError(t, err)
-
-				if tt.expectDrift {
-					require.NotEqual(t, result, result2, "Expected config to change (drift detected)")
-				} else {
-					require.Equal(t, result, result2, "Expected config to be stable (no drift)")
-				}
-			}
+			require.Contains(t, result, fmt.Sprintf(`"deployedRevision":"%s"`, tt.expectRevision))
 		})
 	}
+
+	// Test drift detection: revision advances after rollout completes
+	t.Run("detects drift when deployed revision advances", func(t *testing.T) {
+		status := makeStatus(8, []operatorv1.NodeStatus{
+			{NodeName: "master-0", CurrentRevision: 8},
+			{NodeName: "master-1", CurrentRevision: 8},
+		})
+		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+			&operatorv1.StaticPodOperatorSpec{}, status, nil, nil,
+		)
+
+		configFunc := createEtcdRestartJobConfigFunc(fakeOperatorClient)
+		result1, err := configFunc()
+		require.NoError(t, err)
+
+		// Simulate revision rollout completing on all nodes
+		newStatus := makeStatus(9, []operatorv1.NodeStatus{
+			{NodeName: "master-0", CurrentRevision: 9},
+			{NodeName: "master-1", CurrentRevision: 9},
+		})
+		fakeOperatorClient.UpdateStaticPodOperatorStatus(context.Background(), "0", newStatus)
+
+		result2, err := configFunc()
+		require.NoError(t, err)
+		require.NotEqual(t, result1, result2, "Expected config to change when deployed revision advances")
+	})
+
+	// Test no drift while revision is rolling
+	t.Run("no drift while revision is rolling on one node", func(t *testing.T) {
+		status := makeStatus(9, []operatorv1.NodeStatus{
+			{NodeName: "master-0", CurrentRevision: 8},
+			{NodeName: "master-1", CurrentRevision: 8},
+		})
+		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+			&operatorv1.StaticPodOperatorSpec{}, status, nil, nil,
+		)
+
+		configFunc := createEtcdRestartJobConfigFunc(fakeOperatorClient)
+		result1, err := configFunc()
+		require.NoError(t, err)
+
+		// One node advances but min is still 8
+		newStatus := makeStatus(9, []operatorv1.NodeStatus{
+			{NodeName: "master-0", CurrentRevision: 9},
+			{NodeName: "master-1", CurrentRevision: 8},
+		})
+		fakeOperatorClient.UpdateStaticPodOperatorStatus(context.Background(), "0", newStatus)
+
+		result2, err := configFunc()
+		require.NoError(t, err)
+		require.Equal(t, result1, result2, "Expected config to be stable while revision is rolling")
+	})
 }
 
 // retryableError is a helper type for testing retry logic
