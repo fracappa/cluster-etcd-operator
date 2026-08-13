@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -23,6 +24,7 @@ import (
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/bootstrapteardown"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/ceohelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/operator/operatorclient"
+	"github.com/openshift/cluster-etcd-operator/pkg/tlshelpers"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/etcd"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/jobs"
 	"github.com/openshift/cluster-etcd-operator/pkg/tnf/pkg/tools"
@@ -256,7 +258,7 @@ func startTnfJobcontrollers(
 		etcdRestartAffectedNodesFunc := func() ([]*corev1.Node, error) {
 			return tools.ListNodesFromInformer(lifecycleManager.controlPlaneNodeInformer)
 		}
-		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(operatorClient)
+		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(operatorClient, kubeInformersForNamespaces)
 		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 		// Start status collector (only after transition is complete, when Pacemaker exists)
@@ -460,41 +462,60 @@ func createFencingJobConfigFunc(lifecycleManager *pacemakerLifecycleManager, kub
 	}
 }
 
-// createEtcdRestartJobConfigFunc creates a JobConfigFunc that tracks the minimum
-// static pod revision deployed across all nodes. This revision advances only when
-// ALL nodes have the new cert files on disk, preventing a race where etcd restarts
-// before the CA bundle is synced to the host filesystem.
+// createEtcdRestartJobConfigFunc creates a JobConfigFunc that triggers an etcd
+// restart only when the CA bundle actually changes AND the new certs are on disk.
 //
-// On TNF clusters, etcd runs under Pacemaker (not as a static pod), so it is never
-// restarted automatically by the kubelet on revision changes. This drift-detection
-// provides that restart: whenever the deployed revision advances (CA rotation,
-// cipher suite change, or any other cert/config update), the etcd-restart job fires.
-func createEtcdRestartJobConfigFunc(operatorClient v1helpers.StaticPodOperatorClient) jobs.JobConfigFunc {
+// Drift detection is based on a content hash of the etcd-all-bundles ConfigMap
+// (server-ca-bundle.crt + metrics-ca-bundle.crt). This means non-CA revision
+// changes (e.g., config updates during installation) do not trigger a restart.
+//
+// The timing gate uses the static pod revision: while any node's CurrentRevision
+// is behind LatestAvailableRevision, the function holds the previous stable hash,
+// suppressing drift until all nodes have the new cert files on disk.
+func createEtcdRestartJobConfigFunc(operatorClient v1helpers.StaticPodOperatorClient, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
+	var lastStableConfig string
+
 	return func() (string, error) {
+		configMapLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Lister()
+		cm, err := configMapLister.ConfigMaps(operatorclient.TargetNamespace).Get(tlshelpers.EtcdAllBundlesConfigMapName)
+		if err != nil {
+			return "", fmt.Errorf("failed to get %s configmap: %w", tlshelpers.EtcdAllBundlesConfigMapName, err)
+		}
+
+		h := sha256.New()
+		keys := make([]string, 0, len(cm.Data))
+		for k := range cm.Data {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			h.Write([]byte(k))
+			h.Write([]byte(cm.Data[k]))
+		}
+		currentHash := fmt.Sprintf("%x", h.Sum(nil))
+
 		_, opStatus, _, err := operatorClient.GetStaticPodOperatorState()
 		if err != nil {
 			return "", fmt.Errorf("failed to get operator state: %w", err)
 		}
 
-		// Use the minimum revision across all nodes. This only advances when
-		// every node has deployed the new revision, meaning cert files are on disk.
-		deployedRevision := opStatus.LatestAvailableRevision
+		allDeployed := len(opStatus.NodeStatuses) > 0
 		for _, ns := range opStatus.NodeStatuses {
-			if ns.CurrentRevision < deployedRevision {
-				deployedRevision = ns.CurrentRevision
+			if ns.CurrentRevision < opStatus.LatestAvailableRevision {
+				allDeployed = false
+				break
 			}
 		}
 
-		config := map[string]string{
-			"deployedRevision": fmt.Sprintf("%d", deployedRevision),
+		if !allDeployed {
+			if lastStableConfig == "" {
+				lastStableConfig = currentHash
+			}
+			return lastStableConfig, nil
 		}
 
-		configJSON, err := json.Marshal(config)
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal etcd-restart config: %w", err)
-		}
-
-		return string(configJSON), nil
+		lastStableConfig = currentHash
+		return lastStableConfig, nil
 	}
 }
 
