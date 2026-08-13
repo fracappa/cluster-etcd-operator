@@ -93,6 +93,7 @@ func restartEtcdOnNode(ctx context.Context, nodeIdx, nodeCount int, nodeName str
 	if _, _, err := exec.Execute(ctx, cmd); err != nil {
 		return fmt.Errorf("failed to set restart_no_leave on %s: %w", nodeLabel, err)
 	}
+	defer clearRestartNoLeave(ctx, nodeName, nodeLabel)
 
 	// Restart etcd on the target node. --wait blocks until the resource has
 	// stopped and started again (timeout 300s = 5 min).
@@ -109,6 +110,13 @@ func restartEtcdOnNode(ctx context.Context, nodeIdx, nodeCount int, nodeName str
 
 	klog.Infof("etcd healthy on %s", nodeLabel)
 	return nil
+}
+
+func clearRestartNoLeave(ctx context.Context, nodeName, nodeLabel string) {
+	cmd := fmt.Sprintf(`crm_attribute --lifetime reboot --node %s --name "restart_no_leave" --delete`, nodeName)
+	if _, _, err := exec.Execute(ctx, cmd); err != nil {
+		klog.Warningf("failed to clear restart_no_leave on %s: %v", nodeLabel, err)
+	}
 }
 
 // waitForEtcdHealthy polls etcd endpoint health via podman exec.
