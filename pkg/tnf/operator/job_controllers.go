@@ -479,7 +479,14 @@ func createEtcdRestartJobConfigFunc(operatorClient v1helpers.StaticPodOperatorCl
 		configMapLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Lister()
 		cm, err := configMapLister.ConfigMaps(operatorclient.TargetNamespace).Get(tlshelpers.EtcdAllBundlesConfigMapName)
 		if err != nil {
-			return "", fmt.Errorf("failed to get %s configmap: %w", tlshelpers.EtcdAllBundlesConfigMapName, err)
+			// ConfigMap may not exist yet (informer not synced or cert signer
+			// hasn't created it). Return the last stable config so the controller
+			// doesn't set Degraded and block installation.
+			klog.V(4).Infof("etcd-restart config: %s configmap not available yet: %v", tlshelpers.EtcdAllBundlesConfigMapName, err)
+			if lastStableConfig != "" {
+				return lastStableConfig, nil
+			}
+			return "", nil
 		}
 
 		h := sha256.New()
