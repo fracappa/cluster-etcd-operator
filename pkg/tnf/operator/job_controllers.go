@@ -258,7 +258,7 @@ func startTnfJobcontrollers(
 		etcdRestartAffectedNodesFunc := func() ([]*corev1.Node, error) {
 			return tools.ListNodesFromInformer(lifecycleManager.controlPlaneNodeInformer)
 		}
-		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(operatorClient, kubeInformersForNamespaces)
+		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(kubeInformersForNamespaces)
 		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 		// Start status collector (only after transition is complete, when Pacemaker exists)
@@ -463,29 +463,19 @@ func createFencingJobConfigFunc(lifecycleManager *pacemakerLifecycleManager, kub
 }
 
 // createEtcdRestartJobConfigFunc creates a JobConfigFunc that triggers an etcd
-// restart only when the CA bundle actually changes AND the new certs are on disk.
+// restart when the CA bundle content changes. Drift detection is based on a
+// content hash of the etcd-all-bundles ConfigMap (server-ca-bundle.crt +
+// metrics-ca-bundle.crt). Non-CA changes do not trigger a restart.
 //
-// Drift detection is based on a content hash of the etcd-all-bundles ConfigMap
-// (server-ca-bundle.crt + metrics-ca-bundle.crt). This means non-CA revision
-// changes (e.g., config updates during installation) do not trigger a restart.
-//
-// The timing gate uses the static pod revision: while any node's CurrentRevision
-// is behind LatestAvailableRevision, the function holds the previous stable hash,
-// suppressing drift until all nodes have the new cert files on disk.
-func createEtcdRestartJobConfigFunc(operatorClient v1helpers.StaticPodOperatorClient, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
-	var lastStableConfig string
-
+// In TNF clusters, the etcd-certs directory is synced independently of static
+// pod revisions, so no revision gate is needed — the cert files are on disk
+// before the revision rolls out.
+func createEtcdRestartJobConfigFunc(kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces) jobs.JobConfigFunc {
 	return func() (string, error) {
 		configMapLister := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Lister()
 		cm, err := configMapLister.ConfigMaps(operatorclient.TargetNamespace).Get(tlshelpers.EtcdAllBundlesConfigMapName)
 		if err != nil {
-			// ConfigMap may not exist yet (informer not synced or cert signer
-			// hasn't created it). Return the last stable config so the controller
-			// doesn't set Degraded and block installation.
 			klog.V(4).Infof("etcd-restart config: %s configmap not available yet: %v", tlshelpers.EtcdAllBundlesConfigMapName, err)
-			if lastStableConfig != "" {
-				return lastStableConfig, nil
-			}
 			return "", nil
 		}
 
@@ -499,30 +489,7 @@ func createEtcdRestartJobConfigFunc(operatorClient v1helpers.StaticPodOperatorCl
 			h.Write([]byte(k))
 			h.Write([]byte(cm.Data[k]))
 		}
-		currentHash := fmt.Sprintf("%x", h.Sum(nil))
-
-		_, opStatus, _, err := operatorClient.GetStaticPodOperatorState()
-		if err != nil {
-			return "", fmt.Errorf("failed to get operator state: %w", err)
-		}
-
-		allDeployed := len(opStatus.NodeStatuses) > 0
-		for _, ns := range opStatus.NodeStatuses {
-			if ns.CurrentRevision < opStatus.LatestAvailableRevision {
-				allDeployed = false
-				break
-			}
-		}
-
-		if !allDeployed {
-			if lastStableConfig == "" {
-				lastStableConfig = currentHash
-			}
-			return lastStableConfig, nil
-		}
-
-		lastStableConfig = currentHash
-		return lastStableConfig, nil
+		return fmt.Sprintf("%x", h.Sum(nil)), nil
 	}
 }
 

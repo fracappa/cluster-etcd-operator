@@ -495,19 +495,10 @@ func TestGetNodesWithFencingSecrets(t *testing.T) {
 
 // TestCreateEtcdRestartJobConfigFunc tests the drift detection config function
 // for the etcd-restart job controller. It verifies that:
-// - Drift is only detected when the CA bundle content changes (not on every revision)
-// - The config is held stable while revisions are rolling out (files not yet on disk)
-// - Non-CA revision changes do not trigger drift
+// - Hash is consistent for the same CA bundle content
+// - Drift is detected when the CA bundle content changes
+// - Missing ConfigMap returns empty string (no error, no Degraded)
 func TestCreateEtcdRestartJobConfigFunc(t *testing.T) {
-	makeStatus := func(latestRevision int32, nodeStatuses []operatorv1.NodeStatus) *operatorv1.StaticPodOperatorStatus {
-		return &operatorv1.StaticPodOperatorStatus{
-			OperatorStatus: operatorv1.OperatorStatus{
-				LatestAvailableRevision: latestRevision,
-			},
-			NodeStatuses: nodeStatuses,
-		}
-	}
-
 	setupInformers := func(t *testing.T, bundleData map[string]string) v1helpers.KubeInformersForNamespaces {
 		t.Helper()
 		fakeKubeClient := fake.NewClientset()
@@ -521,14 +512,16 @@ func TestCreateEtcdRestartJobConfigFunc(t *testing.T) {
 				require.True(t, s, "informer for namespace %s type %v failed to sync", ns, typ)
 			}
 		}
-		cmInformer := kubeInformers.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
-		require.NoError(t, cmInformer.GetIndexer().Add(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "etcd-all-bundles",
-				Namespace: operatorclient.TargetNamespace,
-			},
-			Data: bundleData,
-		}))
+		if bundleData != nil {
+			cmInformer := kubeInformers.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
+			require.NoError(t, cmInformer.GetIndexer().Add(&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd-all-bundles",
+					Namespace: operatorclient.TargetNamespace,
+				},
+				Data: bundleData,
+			}))
+		}
 		return kubeInformers
 	}
 
@@ -542,47 +535,34 @@ func TestCreateEtcdRestartJobConfigFunc(t *testing.T) {
 		"metrics-ca-bundle.crt": "-----BEGIN CERTIFICATE-----\nnewMetricsCA\n-----END CERTIFICATE-----",
 	}
 
-	t.Run("no drift on non-CA revision change", func(t *testing.T) {
-		kubeInformers := setupInformers(t, initialBundle)
-		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
-			&operatorv1.StaticPodOperatorSpec{},
-			makeStatus(8, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 8},
-				{NodeName: "master-1", CurrentRevision: 8},
-			}), nil, nil,
-		)
+	t.Run("returns empty string when configmap not available", func(t *testing.T) {
+		kubeInformers := setupInformers(t, nil)
+		configFunc := createEtcdRestartJobConfigFunc(kubeInformers)
+		result, err := configFunc()
+		require.NoError(t, err, "should not return error when configmap missing")
+		require.Empty(t, result, "should return empty string when configmap missing")
+	})
 
-		configFunc := createEtcdRestartJobConfigFunc(fakeOperatorClient, kubeInformers)
+	t.Run("consistent hash for same bundle data", func(t *testing.T) {
+		kubeInformers := setupInformers(t, initialBundle)
+		configFunc := createEtcdRestartJobConfigFunc(kubeInformers)
+
 		result1, err := configFunc()
 		require.NoError(t, err)
-
-		// Revision advances (e.g., config change) but CA bundle is unchanged
-		fakeOperatorClient.UpdateStaticPodOperatorStatus(context.Background(), "0",
-			makeStatus(9, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 9},
-				{NodeName: "master-1", CurrentRevision: 9},
-			}))
+		require.NotEmpty(t, result1)
 
 		result2, err := configFunc()
 		require.NoError(t, err)
-		require.Equal(t, result1, result2, "Expected no drift when CA bundle unchanged")
+		require.Equal(t, result1, result2, "same bundle should produce same hash")
 	})
 
-	t.Run("detects drift when CA bundle changes and rollout completes", func(t *testing.T) {
+	t.Run("detects drift when CA bundle changes", func(t *testing.T) {
 		kubeInformers := setupInformers(t, initialBundle)
-		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
-			&operatorv1.StaticPodOperatorSpec{},
-			makeStatus(8, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 8},
-				{NodeName: "master-1", CurrentRevision: 8},
-			}), nil, nil,
-		)
+		configFunc := createEtcdRestartJobConfigFunc(kubeInformers)
 
-		configFunc := createEtcdRestartJobConfigFunc(fakeOperatorClient, kubeInformers)
 		result1, err := configFunc()
 		require.NoError(t, err)
 
-		// CA rotates and all nodes deploy the new revision
 		cmInformer := kubeInformers.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
 		require.NoError(t, cmInformer.GetIndexer().Update(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
@@ -591,87 +571,10 @@ func TestCreateEtcdRestartJobConfigFunc(t *testing.T) {
 			},
 			Data: rotatedBundle,
 		}))
-		fakeOperatorClient.UpdateStaticPodOperatorStatus(context.Background(), "0",
-			makeStatus(9, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 9},
-				{NodeName: "master-1", CurrentRevision: 9},
-			}))
 
 		result2, err := configFunc()
 		require.NoError(t, err)
-		require.NotEqual(t, result1, result2, "Expected drift when CA bundle changes")
-	})
-
-	t.Run("holds config stable during rollout even with CA change", func(t *testing.T) {
-		kubeInformers := setupInformers(t, initialBundle)
-		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
-			&operatorv1.StaticPodOperatorSpec{},
-			makeStatus(8, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 8},
-				{NodeName: "master-1", CurrentRevision: 8},
-			}), nil, nil,
-		)
-
-		configFunc := createEtcdRestartJobConfigFunc(fakeOperatorClient, kubeInformers)
-		result1, err := configFunc()
-		require.NoError(t, err)
-
-		// CA rotates but revision is still rolling (master-1 behind)
-		cmInformer := kubeInformers.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
-		require.NoError(t, cmInformer.GetIndexer().Update(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "etcd-all-bundles",
-				Namespace: operatorclient.TargetNamespace,
-			},
-			Data: rotatedBundle,
-		}))
-		fakeOperatorClient.UpdateStaticPodOperatorStatus(context.Background(), "0",
-			makeStatus(9, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 9},
-				{NodeName: "master-1", CurrentRevision: 8},
-			}))
-
-		result2, err := configFunc()
-		require.NoError(t, err)
-		require.Equal(t, result1, result2, "Expected config held stable while revision is rolling")
-
-		// Now all nodes catch up
-		fakeOperatorClient.UpdateStaticPodOperatorStatus(context.Background(), "1",
-			makeStatus(9, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 9},
-				{NodeName: "master-1", CurrentRevision: 9},
-			}))
-
-		result3, err := configFunc()
-		require.NoError(t, err)
-		require.NotEqual(t, result1, result3, "Expected drift after rollout completes with new CA")
-	})
-
-	t.Run("no spurious drift during installation", func(t *testing.T) {
-		kubeInformers := setupInformers(t, initialBundle)
-		// During installation nodes start behind and catch up
-		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
-			&operatorv1.StaticPodOperatorSpec{},
-			makeStatus(5, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 3},
-				{NodeName: "master-1", CurrentRevision: 3},
-			}), nil, nil,
-		)
-
-		configFunc := createEtcdRestartJobConfigFunc(fakeOperatorClient, kubeInformers)
-		result1, err := configFunc()
-		require.NoError(t, err)
-
-		// Nodes catch up through multiple revisions (no CA change)
-		fakeOperatorClient.UpdateStaticPodOperatorStatus(context.Background(), "0",
-			makeStatus(7, []operatorv1.NodeStatus{
-				{NodeName: "master-0", CurrentRevision: 7},
-				{NodeName: "master-1", CurrentRevision: 7},
-			}))
-
-		result2, err := configFunc()
-		require.NoError(t, err)
-		require.Equal(t, result1, result2, "Expected no drift during installation when CA unchanged")
+		require.NotEqual(t, result1, result2, "different bundle should produce different hash")
 	})
 }
 

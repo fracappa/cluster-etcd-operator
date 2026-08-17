@@ -79,6 +79,11 @@ type JobRetryState struct {
 }
 
 const (
+	// JobConfigAnnotationKey stores the config hash on jobs for drift detection
+	// across operator restarts. When the operator restarts, in-memory retryState
+	// is lost; this annotation allows recovering the baseline config.
+	JobConfigAnnotationKey = "etcd.openshift.io/job-config"
+
 	// blockedConditionTimeout is how long to wait before returning error when jobs are blocked.
 	// Error triggers Degraded condition via WithSyncDegradedOnError.
 	blockedConditionTimeout = 10 * time.Minute
@@ -246,6 +251,21 @@ func syncMultiNodeJobState(ctx context.Context, jobName string, schedulableNodes
 			initialConfig, err = jobConfigFunc()
 			if err != nil {
 				return fmt.Errorf("failed to get initial job config: %w", err)
+			}
+		}
+
+		// Recover baseline from existing job annotation. When the operator restarts,
+		// in-memory retryState is lost. If a prior job exists with a persisted config
+		// that differs from the current config, use the stored value so drift detection
+		// still fires across restarts.
+		if jobConfigFunc != nil && initialConfig != "" {
+			existingJob, getErr := kubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Get(ctx, jobName, v1.GetOptions{})
+			if getErr == nil {
+				if storedConfig, ok := existingJob.Annotations[JobConfigAnnotationKey]; ok && storedConfig != initialConfig {
+					klog.Infof("Job %s: recovering config baseline from job annotation (stored: %s, current: %s)",
+						jobName, storedConfig, initialConfig)
+					initialConfig = storedConfig
+				}
 			}
 		}
 
@@ -600,6 +620,18 @@ func RunClusterJobController(ctx context.Context, jobType tools.JobType, schedul
 				job.Spec.BackoffLimit = ptr.To(int32(0))
 				if err := configureMultiNodeJob(job, retries); err != nil {
 					return false, err
+				}
+
+				// Persist config hash as annotation for drift detection across operator restarts
+				if jobConfigFunc != nil {
+					retryStateMutex.Lock()
+					if state, ok := retryState[job.Name]; ok && state.LastJobConfig != "" {
+						if job.Annotations == nil {
+							job.Annotations = make(map[string]string)
+						}
+						job.Annotations[JobConfigAnnotationKey] = state.LastJobConfig
+					}
+					retryStateMutex.Unlock()
 				}
 
 				// Set image and command
