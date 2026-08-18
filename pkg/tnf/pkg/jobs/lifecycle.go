@@ -52,6 +52,13 @@ var (
 	// retryStateMutex protects access to retryState map
 	retryStateMutex sync.Mutex
 
+	// configBaseline stores the initial config hash for drift-only jobs.
+	// These jobs should NOT run on first install — only when the config
+	// changes from this baseline. Map key is job name.
+	configBaseline = make(map[string]string)
+	// configBaselineMutex protects access to configBaseline map
+	configBaselineMutex sync.Mutex
+
 	// jobBlockedSince tracks when jobs first became blocked due to affected nodes not being ready.
 	// Map key is job name, value is timestamp when first blocked.
 	// Used to return error after 10 minutes, triggering Degraded condition via WithSyncDegradedOnError.
@@ -209,7 +216,11 @@ func checkNodesReadinessAndSetCondition(ctx context.Context, nodes []*corev1.Nod
 // Detects drift and failures, updates retry state accordingly. Job deletion/recreation is handled
 // by ApplyJob via drift detection (NodeName changed), except for real config/node drift where
 // jobs are explicitly deleted before resetting state.
-func syncMultiNodeJobState(ctx context.Context, jobName string, schedulableNodesFunc SchedulableNodesFunc, affectedNodesFunc AffectedNodesFunc, jobConfigFunc JobConfigFunc, maxRetryAttempts int, kubeClient kubernetes.Interface, operatorClient v1helpers.StaticPodOperatorClient) error {
+//
+// When driftOnly is true, the job will NOT run on first install. Instead, the initial config
+// is stored as a baseline, and the job only fires when the config changes from that baseline.
+// This prevents jobs like etcd-restart from running during fresh installation.
+func syncMultiNodeJobState(ctx context.Context, jobName string, schedulableNodesFunc SchedulableNodesFunc, affectedNodesFunc AffectedNodesFunc, jobConfigFunc JobConfigFunc, maxRetryAttempts int, driftOnly bool, kubeClient kubernetes.Interface, operatorClient v1helpers.StaticPodOperatorClient) error {
 	// Check affected nodes readiness before admitting/retrying job
 	if affectedNodesFunc != nil {
 		affectedNodes, err := affectedNodesFunc()
@@ -267,6 +278,31 @@ func syncMultiNodeJobState(ctx context.Context, jobName string, schedulableNodes
 					initialConfig = storedConfig
 				}
 			}
+		}
+
+		// For drift-only jobs: record baseline and wait for actual config change
+		// before creating retryState. This prevents the job from running on first install.
+		if driftOnly && jobConfigFunc != nil {
+			configBaselineMutex.Lock()
+			baseline, hasBaseline := configBaseline[jobName]
+			if !hasBaseline {
+				// First sync: store the current config as baseline
+				configBaseline[jobName] = initialConfig
+				configBaselineMutex.Unlock()
+				klog.Infof("Job %s (drift-only): recorded config baseline, waiting for drift", jobName)
+				return nil
+			}
+			configBaselineMutex.Unlock()
+
+			// Subsequent syncs: check if config has drifted from baseline
+			if initialConfig == baseline || initialConfig == "" {
+				// No drift yet (or config not available) — don't create state
+				return nil
+			}
+
+			// Drift detected — fall through to create retryState
+			klog.Infof("Job %s (drift-only): config drift detected (baseline: %s, current: %s) - creating job",
+				jobName, baseline, initialConfig)
 		}
 
 		// Now acquire lock and re-check state
@@ -375,6 +411,14 @@ func syncMultiNodeJobState(ctx context.Context, jobName string, schedulableNodes
 	if IsComplete(*existingJob) {
 		// Success - clear degraded condition
 		klog.V(4).Infof("Job %s completed successfully", jobName)
+
+		// For drift-only jobs: update baseline to current config so the job
+		// won't fire again until the next config change.
+		if driftOnly {
+			configBaselineMutex.Lock()
+			configBaseline[jobName] = state.LastJobConfig
+			configBaselineMutex.Unlock()
+		}
 
 		// Clear degraded condition if it was set
 		_, _, err := v1helpers.UpdateStatus(ctx, operatorClient, v1helpers.UpdateConditionFn(operatorv1.OperatorCondition{
@@ -572,7 +616,9 @@ func RunNodeJobController(ctx context.Context, jobType tools.JobType, node *core
 }
 
 // RunClusterJobController starts job controller for cluster-wide job with round-robin retry logic.
-func RunClusterJobController(ctx context.Context, jobType tools.JobType, schedulableNodesFunc SchedulableNodesFunc, affectedNodesFunc AffectedNodesFunc, jobConfigFunc JobConfigFunc, retries int, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, conditions []string) {
+// When driftOnly is true, the job will not run on first install — only when the config from
+// jobConfigFunc changes from the initial baseline (e.g., CA bundle rotation).
+func RunClusterJobController(ctx context.Context, jobType tools.JobType, schedulableNodesFunc SchedulableNodesFunc, affectedNodesFunc AffectedNodesFunc, jobConfigFunc JobConfigFunc, retries int, driftOnly bool, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, conditions []string) {
 	jobName := jobType.GetJobName(nil)
 
 	// Check if controller already running
@@ -602,7 +648,7 @@ func RunClusterJobController(ctx context.Context, jobType tools.JobType, schedul
 				job.Labels["app.kubernetes.io/name"] = jobType.GetNameLabelValue()
 
 				// Sync multi-node job state (handles transitions based on job status)
-				if err := syncMultiNodeJobState(ctx, job.Name, schedulableNodesFunc, affectedNodesFunc, jobConfigFunc, retries, kubeClient, operatorClient); err != nil {
+				if err := syncMultiNodeJobState(ctx, job.Name, schedulableNodesFunc, affectedNodesFunc, jobConfigFunc, retries, driftOnly, kubeClient, operatorClient); err != nil {
 					return false, err
 				}
 
@@ -661,6 +707,7 @@ func RestartClusterJobOrRunController(
 	affectedNodesFunc AffectedNodesFunc,
 	jobConfigFunc JobConfigFunc,
 	retries int,
+	driftOnly bool,
 	controllerContext *controllercmd.ControllerContext,
 	operatorClient v1helpers.StaticPodOperatorClient,
 	kubeClient kubernetes.Interface,
@@ -695,7 +742,7 @@ func RestartClusterJobOrRunController(
 	if !jobExists {
 		// No existing job - reset retry state to start fresh, then run controller
 		resetJobRetryState(jobName)
-		RunClusterJobController(ctx, jobType, schedulableNodesFunc, affectedNodesFunc, jobConfigFunc, retries, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, conditions)
+		RunClusterJobController(ctx, jobType, schedulableNodesFunc, affectedNodesFunc, jobConfigFunc, retries, driftOnly, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, conditions)
 		return nil
 	}
 
@@ -715,7 +762,7 @@ func RestartClusterJobOrRunController(
 	resetJobRetryState(jobName)
 
 	// Run controller after cleanup completes (CEO might have been restarted)
-	RunClusterJobController(ctx, jobType, schedulableNodesFunc, affectedNodesFunc, jobConfigFunc, retries, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, conditions)
+	RunClusterJobController(ctx, jobType, schedulableNodesFunc, affectedNodesFunc, jobConfigFunc, retries, driftOnly, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, conditions)
 
 	return nil
 }

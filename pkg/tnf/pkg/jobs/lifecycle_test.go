@@ -167,9 +167,10 @@ func TestRestartJobOrRunController(t *testing.T) {
 				ctx,
 				tt.jobType,
 				tt.schedulableNodesFunc,
-				nil, // affectedNodesFunc
-				nil, // jobConfigFunc
+				nil,   // affectedNodesFunc
+				nil,   // jobConfigFunc
 				tt.retries,
+				false, // driftOnly
 				controllerContext,
 				fakeOperatorClient,
 				client,
@@ -273,7 +274,7 @@ func TestSyncMultiNodeJobState_RetryProgression(t *testing.T) {
 	}
 
 	// Step 1: Initialize - should create state at attempt 1, node 0
-	err := syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+	err := syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 	require.NoError(t, err)
 	state := getState()
 	require.NotNil(t, state)
@@ -292,7 +293,7 @@ func TestSyncMultiNodeJobState_RetryProgression(t *testing.T) {
 	_, err = fakeKubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Create(ctx, failedJob, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 	require.NoError(t, err)
 	state = getState()
 	require.Equal(t, 1, state.AttemptNumber, "Should still be attempt 1")
@@ -305,7 +306,7 @@ func TestSyncMultiNodeJobState_RetryProgression(t *testing.T) {
 	// Step 3: Job fails on node 1 -> should start attempt 2, back to node 0
 	_, err = fakeKubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Create(ctx, failedJob.DeepCopy(), metav1.CreateOptions{})
 	require.NoError(t, err)
-	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 	require.NoError(t, err)
 	state = getState()
 	require.Equal(t, 2, state.AttemptNumber, "Should advance to attempt 2")
@@ -320,14 +321,14 @@ func TestSyncMultiNodeJobState_RetryProgression(t *testing.T) {
 	// Fail on node 0
 	_, err = fakeKubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Create(ctx, failedJob.DeepCopy(), metav1.CreateOptions{})
 	require.NoError(t, err)
-	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 	require.NoError(t, err)
 	// Delete and recreate on node 1
 	err = fakeKubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Delete(ctx, jobName, metav1.DeleteOptions{})
 	require.NoError(t, err)
 	_, err = fakeKubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Create(ctx, failedJob.DeepCopy(), metav1.CreateOptions{})
 	require.NoError(t, err)
-	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 	require.NoError(t, err)
 	state = getState()
 	require.Equal(t, 1, state.AttemptNumber, "Should reset to attempt 1 after exhausting max attempts")
@@ -348,7 +349,7 @@ func TestSyncMultiNodeJobState_RetryProgression(t *testing.T) {
 	}
 	fakeKubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Create(ctx, successJob, metav1.CreateOptions{})
 
-	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+	err = syncMultiNodeJobState(ctx, jobName, targetNodesFunc, nil, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 	require.NoError(t, err)
 	require.False(t, isDegraded(), "Degraded should be cleared after success")
 }
@@ -448,7 +449,7 @@ func TestSyncMultiNodeJobState_DriftDetection(t *testing.T) {
 			}
 
 			// Step 1: Initialize state
-			err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, jobConfigFunc, maxRetries, fakeKubeClient, fakeOperatorClient)
+			err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, jobConfigFunc, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 			require.NoError(t, err)
 
 			// Verify initial state
@@ -484,7 +485,7 @@ func TestSyncMultiNodeJobState_DriftDetection(t *testing.T) {
 			}
 
 			// Step 3: Sync again - should detect drift and reset state (or advance state for retry)
-			err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, jobConfigFunc, maxRetries, fakeKubeClient, fakeOperatorClient)
+			err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, jobConfigFunc, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 			require.NoError(t, err)
 
 			// For non-drift cases, simulate ApplyJob deleting the job due to NodeName change from retry progression
@@ -522,6 +523,186 @@ func TestSyncMultiNodeJobState_DriftDetection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSyncMultiNodeJobState_DriftOnly(t *testing.T) {
+	ctx := context.Background()
+	jobName := "tnf-etcd-restart-job"
+	maxRetries := 3
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "master-0", UID: "uid-0"},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	schedulableNodesFunc := func() ([]*corev1.Node, error) {
+		return []*corev1.Node{node}, nil
+	}
+
+	t.Run("drift-only job does not fire on first install", func(t *testing.T) {
+		retryStateMutex.Lock()
+		retryState = make(map[string]*JobRetryState)
+		retryStateMutex.Unlock()
+		configBaselineMutex.Lock()
+		configBaseline = make(map[string]string)
+		configBaselineMutex.Unlock()
+
+		fakeKubeClient := fake.NewClientset()
+		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+			&operatorv1.StaticPodOperatorSpec{},
+			u.StaticPodOperatorStatus(),
+			nil, nil,
+		)
+
+		configFunc := func() (string, error) { return "hash-abc123", nil }
+
+		// First sync: should record baseline but NOT create retryState
+		err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		retryStateMutex.Lock()
+		_, exists := retryState[jobName]
+		retryStateMutex.Unlock()
+		require.False(t, exists, "retryState should NOT be created on first install for drift-only jobs")
+
+		configBaselineMutex.Lock()
+		baseline := configBaseline[jobName]
+		configBaselineMutex.Unlock()
+		require.Equal(t, "hash-abc123", baseline, "Baseline should be recorded")
+
+		// Subsequent syncs with same config: still no state
+		err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		retryStateMutex.Lock()
+		_, exists = retryState[jobName]
+		retryStateMutex.Unlock()
+		require.False(t, exists, "retryState should still not exist when config hasn't changed")
+	})
+
+	t.Run("drift-only job fires when config changes", func(t *testing.T) {
+		retryStateMutex.Lock()
+		retryState = make(map[string]*JobRetryState)
+		retryStateMutex.Unlock()
+		configBaselineMutex.Lock()
+		configBaseline = make(map[string]string)
+		configBaselineMutex.Unlock()
+
+		fakeKubeClient := fake.NewClientset()
+		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+			&operatorv1.StaticPodOperatorSpec{},
+			u.StaticPodOperatorStatus(),
+			nil, nil,
+		)
+
+		currentConfig := "hash-abc123"
+		configFunc := func() (string, error) { return currentConfig, nil }
+
+		// First sync: record baseline
+		err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		// Change config (simulate CA rotation)
+		currentConfig = "hash-def456"
+
+		// Next sync: should detect drift and create retryState
+		err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		retryStateMutex.Lock()
+		state, exists := retryState[jobName]
+		retryStateMutex.Unlock()
+		require.True(t, exists, "retryState should be created after drift detected")
+		require.Equal(t, "hash-def456", state.LastJobConfig)
+		require.Equal(t, 1, state.AttemptNumber)
+		require.Equal(t, 0, state.NodeIndex)
+	})
+
+	t.Run("drift-only baseline updates after job completes", func(t *testing.T) {
+		retryStateMutex.Lock()
+		retryState = make(map[string]*JobRetryState)
+		retryStateMutex.Unlock()
+		configBaselineMutex.Lock()
+		configBaseline = make(map[string]string)
+		configBaselineMutex.Unlock()
+
+		fakeKubeClient := fake.NewClientset()
+		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+			&operatorv1.StaticPodOperatorSpec{},
+			u.StaticPodOperatorStatus(),
+			nil, nil,
+		)
+
+		currentConfig := "hash-abc123"
+		configFunc := func() (string, error) { return currentConfig, nil }
+
+		// Record baseline
+		err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		// Drift detected
+		currentConfig = "hash-def456"
+		err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		// Create a completed job to simulate successful restart
+		completedJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: operatorclient.TargetNamespace},
+			Status: batchv1.JobStatus{
+				Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		_, err = fakeKubeClient.BatchV1().Jobs(operatorclient.TargetNamespace).Create(ctx, completedJob, metav1.CreateOptions{})
+		require.NoError(t, err)
+
+		// Sync with completed job: should update baseline
+		err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		configBaselineMutex.Lock()
+		baseline := configBaseline[jobName]
+		configBaselineMutex.Unlock()
+		require.Equal(t, "hash-def456", baseline, "Baseline should be updated after successful completion")
+	})
+
+	t.Run("drift-only with empty config does not create state", func(t *testing.T) {
+		retryStateMutex.Lock()
+		retryState = make(map[string]*JobRetryState)
+		retryStateMutex.Unlock()
+		configBaselineMutex.Lock()
+		configBaseline = make(map[string]string)
+		configBaselineMutex.Unlock()
+
+		fakeKubeClient := fake.NewClientset()
+		fakeOperatorClient := v1helpers.NewFakeStaticPodOperatorClient(
+			&operatorv1.StaticPodOperatorSpec{},
+			u.StaticPodOperatorStatus(),
+			nil, nil,
+		)
+
+		// Config returns empty (ConfigMap not in informer cache yet)
+		configFunc := func() (string, error) { return "", nil }
+
+		err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, nil, configFunc, maxRetries, true, fakeKubeClient, fakeOperatorClient)
+		require.NoError(t, err)
+
+		retryStateMutex.Lock()
+		_, exists := retryState[jobName]
+		retryStateMutex.Unlock()
+		require.False(t, exists, "retryState should not be created when config is empty")
+
+		// Even after recording baseline, empty config should not trigger drift
+		configBaselineMutex.Lock()
+		_, hasBaseline := configBaseline[jobName]
+		configBaselineMutex.Unlock()
+		require.True(t, hasBaseline, "Baseline should be recorded even for empty config")
+	})
 }
 
 func TestSyncMultiNodeJobState_DegradedCondition(t *testing.T) {
@@ -624,7 +805,7 @@ func TestSyncMultiNodeJobState_DegradedCondition(t *testing.T) {
 			}
 
 			// Sync state
-			err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, affectedNodesFunc, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+			err := syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, affectedNodesFunc, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 
 			// Verify error expectation
 			if tt.expectError {
@@ -752,7 +933,7 @@ func TestSyncMultiNodeJobState_NoSchedulableNodesDegradedCondition(t *testing.T)
 			}
 
 			// Sync state
-			err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, affectedNodesFunc, nil, maxRetries, fakeKubeClient, fakeOperatorClient)
+			err = syncMultiNodeJobState(ctx, jobName, schedulableNodesFunc, affectedNodesFunc, nil, maxRetries, false, fakeKubeClient, fakeOperatorClient)
 
 			// Verify error expectation
 			if tt.expectError {

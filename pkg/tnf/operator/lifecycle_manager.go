@@ -319,8 +319,9 @@ func (c *pacemakerLifecycleManager) restartUpdateSetupJob(ctx context.Context) e
 		tools.JobTypeUpdateSetup,
 		schedulableNodesFunc,
 		updateSetupAffectedNodesFunc,
-		nil, // no jobConfigFunc for update-setup
-		3,   // retries
+		nil,   // no jobConfigFunc for update-setup
+		3,     // retries
+		false, // driftOnly
 		c.controllerContext,
 		c.operatorClient,
 		c.kubeClient,

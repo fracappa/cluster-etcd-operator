@@ -238,19 +238,19 @@ func startTnfJobcontrollers(
 		setupAffectedNodesFunc := func() ([]*corev1.Node, error) {
 			return tools.ListNodesFromInformer(lifecycleManager.controlPlaneNodeInformer)
 		}
-		jobs.RunClusterJobController(ctx, tools.JobTypeSetup, schedulableNodesFunc, setupAffectedNodesFunc, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
+		jobs.RunClusterJobController(ctx, tools.JobTypeSetup, schedulableNodesFunc, setupAffectedNodesFunc, nil, 3, false, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
 
 		// Update-setup job: ensures pacemaker cluster configuration is current
 		// Runs post-transition only (not needed during bootstrap)
 		// Only runs when exactly 2 control plane nodes exist (pacemaker limitation)
 		if len(controlPlaneNodeList) == 2 {
-			jobs.RunClusterJobController(ctx, tools.JobTypeUpdateSetup, schedulableNodesFunc, updateSetupAffectedNodesFunc, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+			jobs.RunClusterJobController(ctx, tools.JobTypeUpdateSetup, schedulableNodesFunc, updateSetupAffectedNodesFunc, nil, 3, false, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 		} else {
 			klog.V(4).Infof("Skipping update-setup job controller: requires exactly 2 control plane nodes, have %d", len(controlPlaneNodeList))
 		}
 
 		fencingJobConfigFunc := createFencingJobConfigFunc(lifecycleManager, kubeInformersForNamespaces)
-		jobs.RunClusterJobController(ctx, tools.JobTypeFencing, schedulableNodesFunc, fencingAffectedNodesFunc, fencingJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+		jobs.RunClusterJobController(ctx, tools.JobTypeFencing, schedulableNodesFunc, fencingAffectedNodesFunc, fencingJobConfigFunc, 3, false, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 		// Etcd-restart job: restarts podman-etcd after CA bundle rotation.
 		// etcd 3.6 hot-reloads leaf certs but not --trusted-ca-file / --peer-trusted-ca-file,
@@ -259,7 +259,7 @@ func startTnfJobcontrollers(
 			return tools.ListNodesFromInformer(lifecycleManager.controlPlaneNodeInformer)
 		}
 		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(kubeInformersForNamespaces)
-		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, true, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 		// Start status collector (only after transition is complete, when Pacemaker exists)
 		lifecycleManager.runPacemakerStatusCollectorCronJob(ctx)
@@ -328,11 +328,11 @@ func startTnfJobcontrollers(
 	}
 
 	// Cluster-wide jobs: setup and fencing can run on any node
-	jobs.RunClusterJobController(ctx, tools.JobTypeSetup, schedulableNodesFunc, setupAffectedNodesFunc, nil, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
+	jobs.RunClusterJobController(ctx, tools.JobTypeSetup, schedulableNodesFunc, setupAffectedNodesFunc, nil, 3, false, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.AllConditions)
 
 	// Fencing job with drift detection: captures node UIDs + fencing secret UIDs
 	fencingJobConfigFunc := createFencingJobConfigFunc(lifecycleManager, kubeInformersForNamespaces)
-	jobs.RunClusterJobController(ctx, tools.JobTypeFencing, schedulableNodesFunc, fencingAffectedNodesFunc, fencingJobConfigFunc, 3, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+	jobs.RunClusterJobController(ctx, tools.JobTypeFencing, schedulableNodesFunc, fencingAffectedNodesFunc, fencingJobConfigFunc, 3, false, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
 
 	// Clear legacy condition names from upgrades (controllers recreate with new names)
 	clearLegacyConditions(ctx, operatorClient)
