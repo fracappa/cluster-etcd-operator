@@ -3,6 +3,7 @@ package etcdrestart
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"sort"
@@ -24,7 +25,7 @@ const (
 	etcdHealthPollInterval = 5 * time.Second
 	etcdHealthTimeout      = 5 * time.Minute
 	certSyncPollInterval   = 10 * time.Second
-	certSyncTimeout        = 10 * time.Minute
+	certSyncTimeout        = 5 * time.Minute
 
 	caBundleDiskDir = "/etc/kubernetes/static-pod-resources/etcd-certs/configmaps/etcd-all-bundles"
 )
@@ -47,8 +48,8 @@ func RunTnfEtcdRestart() error {
 		return fmt.Errorf("failed to create kube client: %w", err)
 	}
 
-	// Per-node worst case: 10 min cert sync + 5 min pcs restart + 5 min health = 20 min.
-	// Two nodes sequentially = ~40 min worst case, but cert sync is shared.
+	// Per-node worst case: 5 min cert sync + 5 min pcs restart + 5 min health = 15 min.
+	// Two nodes sequentially = ~30 min worst case, but cert sync is shared.
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	defer cancel()
 
@@ -64,6 +65,15 @@ func RunTnfEtcdRestart() error {
 	if err != nil {
 		return fmt.Errorf("pacemaker cluster not running on this node, will retry on other node: %w", err)
 	}
+
+	// Read the ConfigMap ONCE while the API is still reachable. After CA
+	// rotation, etcd's TLS breaks (etcd 3.6 hot-reloads leaf certs but not
+	// --trusted-ca-file), making the kube API unavailable for subsequent reads.
+	bundleData, expectedHash, err := readBundleConfigMap(ctx, kubeClient)
+	if err != nil {
+		return fmt.Errorf("failed to read etcd-all-bundles ConfigMap: %w", err)
+	}
+	klog.Infof("Cached etcd-all-bundles ConfigMap (hash: %s, %d keys)", expectedHash[:12], len(bundleData))
 
 	nodeNames, err := getControlPlaneNodeNames(ctx, kubeClient)
 	if err != nil {
@@ -85,11 +95,18 @@ func RunTnfEtcdRestart() error {
 		}
 	}()
 
-	// Wait for cert files on disk to match the ConfigMap before restarting.
-	// The ConfigMap update triggers this job, but the revision controller
-	// syncs the files to disk asynchronously.
-	if err := waitForCertSync(ctx, kubeClient); err != nil {
-		return fmt.Errorf("cert files not synced to disk: %w", err)
+	// Wait for cert files on disk to match the cached ConfigMap hash.
+	// Uses the cached hash instead of re-reading the ConfigMap because
+	// the API may be unavailable after CA rotation breaks etcd's TLS.
+	if err := waitForCertSync(ctx, expectedHash); err != nil {
+		// The revision controller may be blocked because etcd is down
+		// (chicken-and-egg: revision controller needs API, API needs etcd,
+		// etcd needs new certs on disk). Write the bundle directly to break
+		// the deadlock.
+		klog.Warningf("Cert sync timed out (%v), writing CA bundle to disk from cached ConfigMap data", err)
+		if writeErr := writeBundleToDisk(ctx, bundleData); writeErr != nil {
+			return fmt.Errorf("cert sync timed out and direct write failed: %w", writeErr)
+		}
 	}
 
 	// Restart the current node last so etcd stays reachable from the job's API calls
@@ -120,7 +137,7 @@ func RunTnfEtcdRestart() error {
 // restartEtcdOnNode restarts etcd on the given node and waits for health.
 // restart_no_leave is already set on all nodes by the caller.
 func restartEtcdOnNode(ctx context.Context, nodeIdx, nodeCount int, nodeName string) error {
-	nodeLabel := fmt.Sprintf("node %d/%d", nodeIdx, nodeCount)
+	nodeLabel := fmt.Sprintf("node %d/%d (%s)", nodeIdx, nodeCount, nodeName)
 	klog.Infof("Restarting etcd on %s", nodeLabel)
 
 	// Restart etcd on the target node. --wait blocks until the resource has
@@ -156,39 +173,14 @@ func clearRestartNoLeave(ctx context.Context, nodeName string) {
 	}
 }
 
-// waitForCertSync polls until the CA bundle on disk matches the etcd-all-bundles
-// ConfigMap content. The ConfigMap update triggers the restart job, but the
-// revision controller syncs files to disk asynchronously.
-func waitForCertSync(ctx context.Context, kubeClient kubernetes.Interface) error {
-	klog.Info("Waiting for CA bundle on disk to match ConfigMap")
-
-	return wait.PollUntilContextTimeout(ctx, certSyncPollInterval, certSyncTimeout, true, func(ctx context.Context) (bool, error) {
-		expectedHash, err := getConfigMapBundleHash(ctx, kubeClient)
-		if err != nil {
-			klog.V(4).Infof("Failed to get ConfigMap bundle hash: %v", err)
-			return false, nil
-		}
-
-		diskHash, err := getDiskBundleHash(ctx)
-		if err != nil {
-			klog.V(4).Infof("Failed to get disk bundle hash: %v", err)
-			return false, nil
-		}
-
-		if expectedHash == diskHash {
-			klog.Infof("CA bundle on disk matches ConfigMap (hash: %s)", expectedHash[:12])
-			return true, nil
-		}
-
-		klog.V(4).Infof("CA bundle not yet synced to disk (ConfigMap: %s, disk: %s)", expectedHash[:12], diskHash[:12])
-		return false, nil
-	})
-}
-
-func getConfigMapBundleHash(ctx context.Context, kubeClient kubernetes.Interface) (string, error) {
-	cm, err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Get(ctx, tlshelpers.EtcdAllBundlesConfigMapName, metav1.GetOptions{})
+// readBundleConfigMap reads the etcd-all-bundles ConfigMap and returns its data
+// and a content hash. Must be called at job startup while the API is still
+// reachable — after CA rotation breaks etcd TLS, the API becomes unavailable.
+func readBundleConfigMap(ctx context.Context, kubeClient kubernetes.Interface) (map[string]string, string, error) {
+	cm, err := kubeClient.CoreV1().ConfigMaps(operatorclient.TargetNamespace).Get(
+		ctx, tlshelpers.EtcdAllBundlesConfigMapName, metav1.GetOptions{})
 	if err != nil {
-		return "", fmt.Errorf("failed to get ConfigMap %s: %w", tlshelpers.EtcdAllBundlesConfigMapName, err)
+		return nil, "", fmt.Errorf("failed to get ConfigMap %s: %w", tlshelpers.EtcdAllBundlesConfigMapName, err)
 	}
 
 	h := sha256.New()
@@ -201,11 +193,56 @@ func getConfigMapBundleHash(ctx context.Context, kubeClient kubernetes.Interface
 		h.Write([]byte(k))
 		h.Write([]byte(cm.Data[k]))
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+
+	return cm.Data, fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// waitForCertSync polls until the CA bundle files on disk match the expected
+// hash (computed from the ConfigMap at job startup). Only reads the local disk —
+// no API calls — so it works even when etcd/API are unavailable.
+func waitForCertSync(ctx context.Context, expectedHash string) error {
+	klog.Infof("Waiting for CA bundle on disk to match ConfigMap (expected: %s)", expectedHash[:12])
+
+	return wait.PollUntilContextTimeout(ctx, certSyncPollInterval, certSyncTimeout, true, func(ctx context.Context) (bool, error) {
+		diskHash, err := getDiskBundleHash(ctx)
+		if err != nil {
+			klog.V(4).Infof("Failed to get disk bundle hash: %v", err)
+			return false, nil
+		}
+
+		if expectedHash == diskHash {
+			klog.Infof("CA bundle on disk matches ConfigMap (hash: %s)", expectedHash[:12])
+			return true, nil
+		}
+
+		klog.V(4).Infof("CA bundle not yet synced (expected: %s, disk: %s)", expectedHash[:12], diskHash[:12])
+		return false, nil
+	})
+}
+
+// writeBundleToDisk writes the ConfigMap data directly to the CA bundle
+// directory on the local node. This is a fallback for when the revision
+// controller cannot sync the files (e.g., because etcd is down).
+func writeBundleToDisk(ctx context.Context, data map[string]string) error {
+	klog.Infof("Writing %d bundle files directly to %s", len(data), caBundleDiskDir)
+
+	if _, _, err := exec.Execute(ctx, fmt.Sprintf("mkdir -p %s", caBundleDiskDir)); err != nil {
+		return fmt.Errorf("failed to create bundle directory: %w", err)
+	}
+
+	for filename, content := range data {
+		path := fmt.Sprintf("%s/%s", caBundleDiskDir, filename)
+		encoded := base64.StdEncoding.EncodeToString([]byte(content))
+		cmd := fmt.Sprintf("printf '%%s' '%s' | base64 -d > %s && chmod 0600 %s", encoded, path, path)
+		if _, _, err := exec.Execute(ctx, cmd); err != nil {
+			return fmt.Errorf("failed to write %s: %w", path, err)
+		}
+		klog.Infof("Wrote %s (%d bytes)", path, len(content))
+	}
+	return nil
 }
 
 func getDiskBundleHash(ctx context.Context) (string, error) {
-	// List files in the bundle directory, sorted alphabetically (same order as ConfigMap keys)
 	stdout, _, err := exec.Execute(ctx, fmt.Sprintf("ls -1 %s", caBundleDiskDir))
 	if err != nil {
 		return "", fmt.Errorf("failed to list bundle directory: %w", err)
