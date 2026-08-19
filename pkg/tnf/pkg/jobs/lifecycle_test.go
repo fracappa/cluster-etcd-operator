@@ -167,8 +167,8 @@ func TestRestartJobOrRunController(t *testing.T) {
 				ctx,
 				tt.jobType,
 				tt.schedulableNodesFunc,
-				nil,   // affectedNodesFunc
-				nil,   // jobConfigFunc
+				nil, // affectedNodesFunc
+				nil, // jobConfigFunc
 				tt.retries,
 				false, // driftOnly
 				controllerContext,

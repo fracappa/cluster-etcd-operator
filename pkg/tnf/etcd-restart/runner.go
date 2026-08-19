@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -22,10 +23,12 @@ import (
 )
 
 const (
-	etcdHealthPollInterval = 5 * time.Second
-	etcdHealthTimeout      = 5 * time.Minute
-	certSyncPollInterval   = 10 * time.Second
-	certSyncTimeout        = 5 * time.Minute
+	etcdHealthPollInterval  = 5 * time.Second
+	etcdHealthTimeout       = 5 * time.Minute
+	certSyncPodPollInterval = 5 * time.Second
+	certSyncPodTimeout      = 2 * time.Minute
+	certSyncPollInterval    = 10 * time.Second
+	certSyncTimeout         = 5 * time.Minute
 
 	caBundleDiskDir = "/etc/kubernetes/static-pod-resources/etcd-certs/configmaps/etcd-all-bundles"
 )
@@ -48,8 +51,6 @@ func RunTnfEtcdRestart() error {
 		return fmt.Errorf("failed to create kube client: %w", err)
 	}
 
-	// Per-node worst case: 5 min cert sync + 5 min pcs restart + 5 min health = 15 min.
-	// Two nodes sequentially = ~30 min worst case, but cert sync is shared.
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	defer cancel()
 
@@ -80,6 +81,16 @@ func RunTnfEtcdRestart() error {
 		return fmt.Errorf("failed to get control plane node names: %w", err)
 	}
 
+	// Sync cert files to ALL nodes before any restart. After CA rotation,
+	// etcd 3.6 hot-reloads leaf certs but not --trusted-ca-file, breaking TLS.
+	// The revision controller syncs files asynchronously and may be blocked by
+	// the outage itself (chicken-and-egg). Creating a pod on each node that
+	// writes the cached ConfigMap data to the host disk breaks this deadlock
+	// and eliminates the cross-node cert sync race.
+	if err := syncCertFilesToAllNodes(ctx, kubeClient, nodeNames, expectedHash, bundleData); err != nil {
+		return fmt.Errorf("failed to sync cert files to nodes: %w", err)
+	}
+
 	// Set restart_no_leave on ALL nodes BEFORE any restart. This protects against
 	// Pacemaker's monitor triggering a recovery (stop+start) before our rolling
 	// restart reaches a node — without this attribute, the RA's start operation
@@ -94,20 +105,6 @@ func RunTnfEtcdRestart() error {
 			clearRestartNoLeave(ctx, nodeName)
 		}
 	}()
-
-	// Wait for cert files on disk to match the cached ConfigMap hash.
-	// Uses the cached hash instead of re-reading the ConfigMap because
-	// the API may be unavailable after CA rotation breaks etcd's TLS.
-	if err := waitForCertSync(ctx, expectedHash); err != nil {
-		// The revision controller may be blocked because etcd is down
-		// (chicken-and-egg: revision controller needs API, API needs etcd,
-		// etcd needs new certs on disk). Write the bundle directly to break
-		// the deadlock.
-		klog.Warningf("Cert sync timed out (%v), writing CA bundle to disk from cached ConfigMap data", err)
-		if writeErr := writeBundleToDisk(ctx, bundleData); writeErr != nil {
-			return fmt.Errorf("cert sync timed out and direct write failed: %w", writeErr)
-		}
-	}
 
 	// Restart the current node last so etcd stays reachable from the job's API calls
 	sortedNames := make([]string, 0, len(nodeNames))
@@ -134,14 +131,171 @@ func RunTnfEtcdRestart() error {
 	return nil
 }
 
+// syncCertFilesToAllNodes ensures the CA bundle files are written to the host
+// disk on every control-plane node. It first tries creating a cert-sync pod on
+// each node (reliable, works cross-node). If that fails, it falls back to a
+// local-only sync (checks disk hash, or writes directly via nsenter).
+func syncCertFilesToAllNodes(ctx context.Context, kubeClient kubernetes.Interface, nodeNames []string, expectedHash string, bundleData map[string]string) error {
+	if err := createAndWaitForCertSyncPods(ctx, kubeClient, nodeNames, bundleData); err != nil {
+		klog.Warningf("Cert-sync pods failed: %v; falling back to local-only cert sync", err)
+		if syncErr := waitForCertSync(ctx, expectedHash); syncErr != nil {
+			klog.Warningf("Local cert sync timed out: %v; writing to local disk directly", syncErr)
+			if writeErr := writeBundleToDisk(ctx, bundleData); writeErr != nil {
+				return fmt.Errorf("all cert sync methods failed (pods: %v, wait: %v, write: %w)", err, syncErr, writeErr)
+			}
+		}
+		klog.Warning("Only local node cert files verified; remote node cert sync is best-effort")
+	}
+	return nil
+}
+
+// createAndWaitForCertSyncPods creates a short-lived pod on each node that
+// writes the CA bundle data to the host disk via a hostPath volume. The bundle
+// data is embedded directly in the pod command (base64-encoded) so there is no
+// dependency on ConfigMap volume caching or the API being available after pod
+// creation. Must be called while the API is still reachable.
+func createAndWaitForCertSyncPods(ctx context.Context, kubeClient kubernetes.Interface, nodeNames []string, bundleData map[string]string) error {
+	image := os.Getenv("OPERATOR_IMAGE")
+	if image == "" {
+		return fmt.Errorf("OPERATOR_IMAGE not set")
+	}
+
+	script := buildCertWriteScript(bundleData)
+
+	podNames := make([]string, 0, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		podName := fmt.Sprintf("tnf-cert-sync-%s", nodeName)
+		podNames = append(podNames, podName)
+
+		// Clean up any leftover pod from a previous attempt
+		if err := kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Delete(ctx, podName, metav1.DeleteOptions{}); err == nil {
+			waitForPodDeletion(ctx, kubeClient, podName)
+		}
+
+		privileged := true
+		hostPathType := corev1.HostPathDirectoryOrCreate
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      podName,
+				Namespace: operatorclient.TargetNamespace,
+				Labels:    map[string]string{"app": "tnf-cert-sync"},
+				Annotations: map[string]string{
+					"openshift.io/required-scc": "privileged",
+				},
+			},
+			Spec: corev1.PodSpec{
+				NodeName:                      nodeName,
+				ServiceAccountName:            "tnf-setup-manager",
+				PriorityClassName:             "system-node-critical",
+				RestartPolicy:                 corev1.RestartPolicyNever,
+				TerminationGracePeriodSeconds: int64Ptr(10),
+				Tolerations: []corev1.Toleration{{
+					Operator: corev1.TolerationOpExists,
+				}},
+				Containers: []corev1.Container{{
+					Name:    "sync",
+					Image:   image,
+					Command: []string{"/bin/sh", "-c", script},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "target", MountPath: "/target"},
+					},
+					SecurityContext: &corev1.SecurityContext{
+						Privileged: &privileged,
+					},
+				}},
+				Volumes: []corev1.Volume{{
+					Name: "target",
+					VolumeSource: corev1.VolumeSource{
+						HostPath: &corev1.HostPathVolumeSource{
+							Path: caBundleDiskDir,
+							Type: &hostPathType,
+						},
+					},
+				}},
+			},
+		}
+
+		if _, err := kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+			cleanupCertSyncPods(ctx, kubeClient, podNames)
+			return fmt.Errorf("failed to create cert-sync pod on %s: %w", nodeName, err)
+		}
+		klog.Infof("Created cert-sync pod on %s", nodeName)
+	}
+
+	defer cleanupCertSyncPods(ctx, kubeClient, podNames)
+
+	for _, podName := range podNames {
+		if err := waitForPodCompletion(ctx, kubeClient, podName); err != nil {
+			return fmt.Errorf("cert-sync pod %s: %w", podName, err)
+		}
+		klog.Infof("Cert-sync pod %s completed successfully", podName)
+	}
+
+	klog.Info("Cert files synced to all nodes via cert-sync pods")
+	return nil
+}
+
+// buildCertWriteScript creates a shell script that writes each bundle file
+// from base64-encoded data. The data is embedded in the script so the pod has
+// no runtime dependency on the kube API or ConfigMap volumes.
+func buildCertWriteScript(bundleData map[string]string) string {
+	keys := make([]string, 0, len(bundleData))
+	for k := range bundleData {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var parts []string
+	for _, filename := range keys {
+		encoded := base64.StdEncoding.EncodeToString([]byte(bundleData[filename]))
+		parts = append(parts, fmt.Sprintf("printf '%%s' '%s' | base64 -d > /target/%s", encoded, filename))
+	}
+	parts = append(parts, "chmod 0600 /target/*")
+	return strings.Join(parts, " && ")
+}
+
+func waitForPodDeletion(ctx context.Context, kubeClient kubernetes.Interface, podName string) {
+	_ = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, err := kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			return true, nil
+		}
+		return false, nil
+	})
+}
+
+func waitForPodCompletion(ctx context.Context, kubeClient kubernetes.Interface, podName string) error {
+	return wait.PollUntilContextTimeout(ctx, certSyncPodPollInterval, certSyncPodTimeout, true, func(ctx context.Context) (bool, error) {
+		pod, err := kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			klog.V(4).Infof("Failed to get cert-sync pod %s: %v", podName, err)
+			return false, nil
+		}
+		switch pod.Status.Phase {
+		case corev1.PodSucceeded:
+			return true, nil
+		case corev1.PodFailed:
+			return false, fmt.Errorf("pod %s failed", podName)
+		default:
+			return false, nil
+		}
+	})
+}
+
+func cleanupCertSyncPods(ctx context.Context, kubeClient kubernetes.Interface, podNames []string) {
+	for _, podName := range podNames {
+		if err := kubeClient.CoreV1().Pods(operatorclient.TargetNamespace).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
+			klog.V(4).Infof("Failed to delete cert-sync pod %s: %v", podName, err)
+		}
+	}
+}
+
 // restartEtcdOnNode restarts etcd on the given node and waits for health.
 // restart_no_leave is already set on all nodes by the caller.
 func restartEtcdOnNode(ctx context.Context, nodeIdx, nodeCount int, nodeName string) error {
 	nodeLabel := fmt.Sprintf("node %d/%d (%s)", nodeIdx, nodeCount, nodeName)
 	klog.Infof("Restarting etcd on %s", nodeLabel)
 
-	// Restart etcd on the target node. --wait blocks until the resource has
-	// stopped and started again (timeout 300s = 5 min).
 	cmd := fmt.Sprintf("/usr/sbin/pcs resource restart etcd-clone %s --wait=300", nodeName)
 	if _, _, err := exec.Execute(ctx, cmd); err != nil {
 		return fmt.Errorf("pcs resource restart failed on %s: %w", nodeLabel, err)
@@ -198,8 +352,7 @@ func readBundleConfigMap(ctx context.Context, kubeClient kubernetes.Interface) (
 }
 
 // waitForCertSync polls until the CA bundle files on disk match the expected
-// hash (computed from the ConfigMap at job startup). Only reads the local disk —
-// no API calls — so it works even when etcd/API are unavailable.
+// hash. Fallback path used when cert-sync pods fail.
 func waitForCertSync(ctx context.Context, expectedHash string) error {
 	klog.Infof("Waiting for CA bundle on disk to match ConfigMap (expected: %s)", expectedHash[:12])
 
@@ -221,8 +374,7 @@ func waitForCertSync(ctx context.Context, expectedHash string) error {
 }
 
 // writeBundleToDisk writes the ConfigMap data directly to the CA bundle
-// directory on the local node. This is a fallback for when the revision
-// controller cannot sync the files (e.g., because etcd is down).
+// directory on the local node via nsenter. Last-resort fallback.
 func writeBundleToDisk(ctx context.Context, data map[string]string) error {
 	klog.Infof("Writing %d bundle files directly to %s", len(data), caBundleDiskDir)
 
@@ -299,3 +451,5 @@ func getControlPlaneNodeNames(ctx context.Context, kubeClient kubernetes.Interfa
 	sort.Strings(names)
 	return names, nil
 }
+
+func int64Ptr(i int64) *int64 { return &i }
