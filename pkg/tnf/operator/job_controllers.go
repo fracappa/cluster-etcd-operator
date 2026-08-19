@@ -259,7 +259,8 @@ func startTnfJobcontrollers(
 			return tools.ListNodesFromInformer(lifecycleManager.controlPlaneNodeInformer)
 		}
 		etcdRestartJobConfigFunc := createEtcdRestartJobConfigFunc(kubeInformersForNamespaces)
-		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, true, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions)
+		configMapInformer := kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Core().V1().ConfigMaps().Informer()
+		jobs.RunClusterJobController(ctx, tools.JobTypeEtcdRestart, schedulableNodesFunc, etcdRestartAffectedNodesFunc, etcdRestartJobConfigFunc, 3, true, controllerContext, operatorClient, kubeClient, kubeInformersForNamespaces, jobs.DefaultConditions, configMapInformer)
 
 		// Start status collector (only after transition is complete, when Pacemaker exists)
 		lifecycleManager.runPacemakerStatusCollectorCronJob(ctx)

@@ -618,7 +618,7 @@ func RunNodeJobController(ctx context.Context, jobType tools.JobType, node *core
 // RunClusterJobController starts job controller for cluster-wide job with round-robin retry logic.
 // When driftOnly is true, the job will not run on first install — only when the config from
 // jobConfigFunc changes from the initial baseline (e.g., CA bundle rotation).
-func RunClusterJobController(ctx context.Context, jobType tools.JobType, schedulableNodesFunc SchedulableNodesFunc, affectedNodesFunc AffectedNodesFunc, jobConfigFunc JobConfigFunc, retries int, driftOnly bool, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, conditions []string) {
+func RunClusterJobController(ctx context.Context, jobType tools.JobType, schedulableNodesFunc SchedulableNodesFunc, affectedNodesFunc AffectedNodesFunc, jobConfigFunc JobConfigFunc, retries int, driftOnly bool, controllerContext *controllercmd.ControllerContext, operatorClient v1helpers.StaticPodOperatorClient, kubeClient kubernetes.Interface, kubeInformersForNamespaces v1helpers.KubeInformersForNamespaces, conditions []string, extraInformers ...factory.Informer) {
 	jobName := jobType.GetJobName(nil)
 
 	// Check if controller already running
@@ -641,7 +641,7 @@ func RunClusterJobController(ctx context.Context, jobType tools.JobType, schedul
 		kubeClient,
 		kubeInformersForNamespaces.InformersFor(operatorclient.TargetNamespace).Batch().V1().Jobs(),
 		conditions,
-		[]factory.Informer{},
+		extraInformers,
 		[]JobHookFunc{
 			func(_ *operatorv1.OperatorSpec, job *batchv1.Job) (bool, error) {
 				job.SetName(jobName)
